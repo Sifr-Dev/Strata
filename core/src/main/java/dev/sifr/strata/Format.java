@@ -76,7 +76,7 @@ final class Format {
                 }
                 ByteBuffer record = ByteBuffer.wrap(body).order(ByteOrder.LITTLE_ENDIAN);
                 int count = record.getInt();
-                if (count < 1) throw new IOException("invalid WAL batch count");
+                if (count < 1 || count > (length - 4) / 5) throw new IOException("invalid WAL batch count");
                 List<Mutation> batch = new ArrayList<>(count);
                 for (int i = 0; i < count; i++) {
                     if (record.remaining() < 5) throw new IOException("truncated WAL mutation");
@@ -102,6 +102,8 @@ final class Format {
 
     static NavigableMap<ByteKey, byte[]> readSegment(Path path, StrataOptions options) throws IOException {
         if (!Files.exists(path)) return new TreeMap<>();
+        long maximumBytes = Math.addExact(Math.multiplyExact(options.maxLiveBytes(), 9), 16);
+        if (Files.size(path) > maximumBytes) throw new IOException("segment exceeds configured physical bounds");
         try (InputStream in = new BufferedInputStream(Files.newInputStream(path))) {
             expectMagic(in, SEGMENT_MAGIC);
             byte[] payload = in.readAllBytes();
@@ -112,7 +114,7 @@ final class Format {
             if (stored != (int) crc.getValue()) throw new IOException("segment checksum mismatch: " + path.getFileName());
             ByteBuffer b = ByteBuffer.wrap(payload, 0, split).order(ByteOrder.LITTLE_ENDIAN);
             long count = b.getLong();
-            if (count < 0 || count > options.maxLiveBytes() + 1) throw new IOException("invalid segment entry count");
+            if (count < 0 || count > options.maxLiveBytes()) throw new IOException("invalid segment entry count");
             TreeMap<ByteKey, byte[]> result = new TreeMap<>();
             for (long i = 0; i < count; i++) {
                 if (b.remaining() < 8) throw new IOException("truncated segment entry");
@@ -128,7 +130,7 @@ final class Format {
         }
     }
 
-    static void writeSegment(Path path, NavigableMap<ByteKey, byte[]> values) throws IOException {
+    static long writeSegment(Path path, NavigableMap<ByteKey, byte[]> values) throws IOException {
         try (OutputStream out = new BufferedOutputStream(Files.newOutputStream(path, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE))) {
             out.write(SEGMENT_MAGIC);
             CRC32 crc = new CRC32();
@@ -144,28 +146,40 @@ final class Format {
             }
             out.write(java.nio.ByteBuffer.allocate(4).order(java.nio.ByteOrder.LITTLE_ENDIAN).putInt((int) crc.getValue()).array());
         }
+        try (FileChannel channel = FileChannel.open(path, StandardOpenOption.READ)) { channel.force(true); }
+        byte[] bytes = Files.readAllBytes(path);
+        int offset = bytes.length - 4;
+        return Integer.toUnsignedLong(ByteBuffer.wrap(bytes, offset, 4).order(ByteOrder.LITTLE_ENDIAN).getInt());
     }
 
-    static void writeManifest(Path path, long sequence, long generation) throws IOException {
+    static long segmentChecksum(Path path) throws IOException {
+        byte[] bytes = Files.readAllBytes(path);
+        if (bytes.length < 4) throw new IOException("truncated segment checksum");
+        return Integer.toUnsignedLong(ByteBuffer.wrap(bytes, bytes.length - 4, 4).order(ByteOrder.LITTLE_ENDIAN).getInt());
+    }
+
+    record Checkpoint(long sequence, long generation, long segmentChecksum) {}
+
+    static void writeManifest(Path path, long sequence, long generation, long segmentChecksum) throws IOException {
         try (FileChannel channel = FileChannel.open(path, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)) {
-            ByteBuffer payload = ByteBuffer.allocate(8 + 16 + 4).order(ByteOrder.LITTLE_ENDIAN);
-            payload.put(MANIFEST_MAGIC).putLong(sequence).putLong(generation);
-            CRC32 crc = new CRC32(); crc.update(payload.array(), 8, 16);
+            ByteBuffer payload = ByteBuffer.allocate(8 + 24 + 4).order(ByteOrder.LITTLE_ENDIAN);
+            payload.put(MANIFEST_MAGIC).putLong(sequence).putLong(generation).putLong(segmentChecksum);
+            CRC32 crc = new CRC32(); crc.update(payload.array(), 8, 24);
             payload.putInt((int) crc.getValue()).flip();
             writeFully(channel, payload);
             channel.force(true);
         }
     }
 
-    static long[] readManifest(Path path) throws IOException {
-        if (!Files.exists(path)) return new long[] {0, 0};
+    static Checkpoint readManifest(Path path) throws IOException {
+        if (!Files.exists(path)) return null;
         byte[] bytes = Files.readAllBytes(path);
-        if (bytes.length != 28 || !Arrays.equals(Arrays.copyOf(bytes, 8), MANIFEST_MAGIC)) throw new IOException("invalid manifest");
+        if (bytes.length != 36 || !Arrays.equals(Arrays.copyOf(bytes, 8), MANIFEST_MAGIC)) throw new IOException("invalid manifest");
         ByteBuffer b = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN); b.position(8);
-        long sequence = b.getLong(), generation = b.getLong();
-        CRC32 crc = new CRC32(); crc.update(bytes, 8, 16);
-        if (b.getInt() != (int) crc.getValue() || sequence < 0 || generation < 0) throw new IOException("manifest checksum/version mismatch");
-        return new long[] {sequence, generation};
+        long sequence = b.getLong(), generation = b.getLong(), checksum = b.getLong();
+        CRC32 crc = new CRC32(); crc.update(bytes, 8, 24);
+        if (b.getInt() != (int) crc.getValue() || sequence < 0 || generation < 0 || checksum < 0) throw new IOException("manifest checksum/version mismatch");
+        return new Checkpoint(sequence, generation, checksum);
     }
 
     static void forceDirectory(Path path) throws IOException {

@@ -19,6 +19,8 @@ One frame is one atomic batch. Complete frames replay in order. A partial final 
 
 ## Manifest
 
-`STRMAN1\n`, `u64 sequence`, `u64 generation`, `u32 CRC-32` of the two numeric fields. Segment and manifest are written to temporary files, forced and atomically replaced before directory synchronization.
+`STRMAN1\n`, `u64 sequence`, `u64 generation`, `u64 segmentChecksum`, and `u32 CRC-32` of the three numeric fields. The manifest selects `segment-G.sst` and `wal-G.log`, where `G` is its generation. Segment and WAL contents are written and forced under temporary names before the manifest replacement and directory synchronization. One manifest replacement therefore selects one consistent generation; a segment or WAL left by an uncommitted generation is ignored.
+
+The committed segment's CRC-32 identity is checked against the manifest during recovery. Old generation files are retained for diagnostics in this early milestone, so repeated compaction consumes additional disk space; an explicit reclamation policy is future work. The engine must not run out of disk headroom silently.
 
 Version 1 readers reject other magic and malformed lengths. No automatic migration exists in this 0.x milestone.

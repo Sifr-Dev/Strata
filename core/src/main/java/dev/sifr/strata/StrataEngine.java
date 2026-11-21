@@ -11,8 +11,8 @@ import java.util.concurrent.locks.ReentrantLock;
 final class StrataEngine implements Strata {
     private final StrataOptions options;
     private final Path directory;
-    private final Path logPath;
-    private final Path segmentPath;
+    private Path logPath;
+    private Path segmentPath;
     private final Path manifestPath;
     private final ReentrantLock writer = new ReentrantLock();
     private final Object lifecycle = new Object();
@@ -22,14 +22,14 @@ final class StrataEngine implements Strata {
     private volatile StorageState state;
     private long generation;
     private long liveBytes;
+    private long segmentChecksum;
     private boolean closed;
     private IOException failure;
 
     private StrataEngine(StrataOptions options) {
         this.options = options;
         directory = options.directory().toAbsolutePath().normalize();
-        logPath = directory.resolve("wal.log");
-        segmentPath = directory.resolve("segment-1.sst");
+
         manifestPath = directory.resolve("MANIFEST");
     }
 
@@ -53,11 +53,20 @@ final class StrataEngine implements Strata {
             lease.close();
             throw error;
         }
-        long[] manifest = Format.readManifest(manifestPath);
-        NavigableMap<ByteKey, byte[]> recovered = Format.readSegment(segmentPath, options);
-        StorageState next = new StorageState(recovered, manifest[0]);
-        generation = manifest[1];
-        for (Mutation mutation : Format.readLog(logPath)) {
+        Format.Checkpoint manifest = Format.readManifest(manifestPath);
+        if (manifest != null) {
+            generation = manifest.generation();
+            segmentChecksum = manifest.segmentChecksum();
+            segmentPath = segmentPath(generation);
+            logPath = walPath(generation);
+        }
+        NavigableMap<ByteKey, byte[]> recovered = segmentPath == null ? new TreeMap<>() : Format.readSegment(segmentPath, options);
+        if (manifest != null) {
+            long actualChecksum = Format.segmentChecksum(segmentPath);
+            if (actualChecksum != segmentChecksum) throw new IOException("segment identity does not match committed manifest");
+        }
+        StorageState next = new StorageState(recovered, manifest == null ? 0 : manifest.sequence());
+        for (Mutation mutation : logPath == null ? List.<Mutation>of() : Format.readLog(logPath)) {
             Format.validate(mutation.key(), mutation.value(), options);
             next = next.apply(mutation);
         }
@@ -134,26 +143,38 @@ final class StrataEngine implements Strata {
         FileChannel previousLog = log;
         try {
             long nextGeneration = generation + 1;
+            Path nextSegment = segmentPath(nextGeneration);
+            Path nextWal = walPath(nextGeneration);
             Path segmentTmp = directory.resolve("segment.tmp");
             Path manifestTmp = directory.resolve("MANIFEST.tmp");
+            Path walTmp = directory.resolve("wal.tmp");
             Files.deleteIfExists(segmentTmp);
             Files.deleteIfExists(manifestTmp);
-            Format.writeSegment(segmentTmp, checkpoint.values);
-            Format.writeManifest(manifestTmp, checkpoint.sequence, nextGeneration);
+            Files.deleteIfExists(walTmp);
+            long checksum = Format.writeSegment(segmentTmp, checkpoint.values);
+            Format.writeManifest(manifestTmp, checkpoint.sequence, nextGeneration, checksum);
+            try (FileChannel wal = FileChannel.open(walTmp, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)) {
+                Format.writeFully(wal, ByteBuffer.wrap(Format.WAL_MAGIC));
+                wal.force(true);
+            }
             try {
-                Files.move(segmentTmp, segmentPath, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+                // Generation-scoped names make an uncommitted segment/WAL harmless after a crash.
+                Files.move(segmentTmp, nextSegment, StandardCopyOption.ATOMIC_MOVE);
+                Files.move(walTmp, nextWal, StandardCopyOption.ATOMIC_MOVE);
+                // This single manifest replacement selects one complete generation atomically.
                 Files.move(manifestTmp, manifestPath, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
             } catch (AtomicMoveNotSupportedException error) {
                 throw new IOException("atomic checkpoint replacement is required but unsupported", error);
             }
             Format.forceDirectory(directory);
+            log = FileChannel.open(nextWal, StandardOpenOption.APPEND);
             if (previousLog != null) previousLog.close();
-            Files.deleteIfExists(logPath);
-            log = FileChannel.open(logPath, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE);
-            Format.writeFully(log, ByteBuffer.wrap(Format.WAL_MAGIC));
-            log.force(true);
-            Format.forceDirectory(directory);
+            segmentPath = nextSegment;
+            logPath = nextWal;
             generation = nextGeneration;
+            segmentChecksum = checksum;
+            // Retain obsolete generation files for diagnostic recovery in this 0.x milestone.
+            // Documented disk-growth policy is required before automatic reclamation.
         } catch (IOException error) {
             if (previousLog != null) {
                 try { previousLog.close(); } catch (IOException ignored) { }
@@ -162,6 +183,9 @@ final class StrataEngine implements Strata {
             throw error;
         }
     }
+
+    private Path segmentPath(long value) { return directory.resolve("segment-" + value + ".sst"); }
+    private Path walPath(long value) { return directory.resolve("wal-" + value + ".log"); }
 
     @Override public void close() throws IOException {
         writer.lock();

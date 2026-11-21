@@ -56,7 +56,7 @@ class StrataEngineTest {
 
     @Test void truncatedTailDoesNotLosePreviousFrames() throws Exception {
         try (Strata db = Strata.open(temp)) { db.put(b("stable"), b("yes")); db.put(b("tail"), b("remove")); }
-        Path wal = temp.resolve("wal.log");
+        Path wal = temp.resolve("wal-1.log");
         byte[] original = Files.readAllBytes(wal);
         Files.write(wal, Arrays.copyOf(original, original.length - 2), StandardOpenOption.TRUNCATE_EXISTING);
         try (Strata db = Strata.open(temp)) {
@@ -72,12 +72,15 @@ class StrataEngineTest {
             db.write(List.of(Mutation.put(b("stable"), b("yes")), Mutation.put(b("also-stable"), b("yes"))));
             db.put(b("tail"), b("remove"));
         }
-        byte[] wal = Files.readAllBytes(originalDir.resolve("wal.log"));
+        byte[] wal = Files.readAllBytes(originalDir.resolve("wal-1.log"));
         int firstBatchEnd = wal.length - Format.frame(Mutation.put(b("tail"), b("remove"))).length;
         for (int length = 0; length < wal.length; length++) {
             Path candidate = temp.resolve("truncated-" + length);
             Files.createDirectories(candidate);
-            Files.write(candidate.resolve("wal.log"), Arrays.copyOf(wal, length));
+            Path emptySegment = candidate.resolve("segment-1.sst");
+            Format.writeSegment(emptySegment, new TreeMap<>());
+            Format.writeManifest(candidate.resolve("MANIFEST"), 0, 1, Format.segmentChecksum(emptySegment));
+            Files.write(candidate.resolve("wal-1.log"), Arrays.copyOf(wal, length));
             try (Strata db = Strata.open(candidate)) {
                 if (length == wal.length) {
                     assertEquals("yes", s(db.get(b("stable")).orElseThrow()));
@@ -100,13 +103,38 @@ class StrataEngineTest {
         try (Strata db = Strata.open(temp)) {
             db.write(List.of(Mutation.put(b("first"), b("one")), Mutation.put(b("second"), b("two"))));
         }
-        Path wal = temp.resolve("wal.log");
+        Path wal = temp.resolve("wal-1.log");
         byte[] original = Files.readAllBytes(wal);
         Files.write(wal, Arrays.copyOf(original, original.length - 1), StandardOpenOption.TRUNCATE_EXISTING);
         try (Strata db = Strata.open(temp)) {
             assertTrue(db.get(b("first")).isEmpty());
             assertTrue(db.get(b("second")).isEmpty());
         }
+    }
+
+    @Test void uncommittedGenerationCannotReplaceCommittedManifest() throws Exception {
+        try (Strata db = Strata.open(temp)) { db.put(b("committed"), b("old")); }
+        TreeMap<ByteKey, byte[]> uncommitted = new TreeMap<>();
+        uncommitted.put(new ByteKey(b("uncommitted")), b("new"));
+        Format.writeSegment(temp.resolve("segment-999.sst"), uncommitted);
+        Files.write(temp.resolve("wal-999.log"), Format.WAL_MAGIC);
+        try (Strata db = Strata.open(temp)) {
+            assertEquals("old", s(db.get(b("committed")).orElseThrow()));
+            assertTrue(db.get(b("uncommitted")).isEmpty());
+        }
+    }
+
+    @Test void manifestRejectsSegmentFromAnotherGeneration() throws Exception {
+        try (Strata db = Strata.open(temp)) { db.put(b("committed"), b("old")); }
+        var manifest = Format.readManifest(temp.resolve("MANIFEST"));
+        Files.move(temp.resolve("segment-1.sst"), temp.resolve("segment-2.sst"));
+        TreeMap<ByteKey, byte[]> replacement = new TreeMap<>();
+        replacement.put(new ByteKey(b("replacement")), b("new"));
+        Format.writeSegment(temp.resolve("segment-1.sst"), replacement);
+        assertThrows(java.io.IOException.class, () -> Strata.open(temp));
+        // Restore the committed generation after proving identity validation.
+        Files.delete(temp.resolve("segment-1.sst"));
+        Files.move(temp.resolve("segment-2.sst"), temp.resolve("segment-1.sst"));
     }
 
     @Test void secondProcessCannotAcquireStoreLease() throws Exception {
