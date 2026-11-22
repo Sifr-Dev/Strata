@@ -13,6 +13,8 @@ All integers are unsigned-length fields encoded little-endian unless stated othe
 
 One frame is one atomic batch. Complete frames replay in order. A partial final header/payload/checksum or checksum mismatch at the physical end discards that frame; subsequent data or malformed interior data is fatal. The WAL is checkpointed and recreated on open, so a damaged tail is never extended.
 
+The WAL is preallocated in fixed windows (default 1 MiB). The region between the last written frame and the physical end of the file is zero filler; a frame header whose length field is zero terminates recovery, and any nonzero length that fails validation remains fatal. The logical end of the log is therefore the offset of the first zero length field, not the file size.
+
 ## Segment
 
 `STRSEG1\n`, `u64 count`, then each entry's `u32 keyLength`, `u32 valueLength`, key and value. A final `u32 CRC-32` covers all bytes after the magic. Entries are strictly unique and ordered by unsigned key bytes.

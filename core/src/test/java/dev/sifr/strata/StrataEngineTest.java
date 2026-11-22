@@ -13,6 +13,22 @@ class StrataEngineTest {
     static byte[] b(String value) { return value.getBytes(StandardCharsets.UTF_8); }
     static String s(byte[] value) { return new String(value, StandardCharsets.UTF_8); }
 
+    /**
+     * Logical WAL extent: the WAL is preallocated with zero filler, so the file
+     * length is not the amount of written data. Walk the frames and stop at the
+     * first zero length field. Crash tests truncate relative to this offset.
+     */
+    static int logicalEnd(byte[] wal) {
+        int offset = Format.WAL_MAGIC.length;
+        while (offset + 4 <= wal.length) {
+            int length = java.nio.ByteBuffer.wrap(wal, offset, 4)
+                    .order(java.nio.ByteOrder.LITTLE_ENDIAN).getInt();
+            if (length == 0) return offset;
+            offset += 8 + length;  // length field + batch count + body + CRC
+        }
+        return offset;
+    }
+
     @Test void persistsOrderedEntriesAndDeletes() throws Exception {
         try (Strata db = Strata.open(temp)) {
             db.put(b("c"), b("3")); db.put(b("a"), b("1")); db.put(b("b"), b("2"));
@@ -58,7 +74,12 @@ class StrataEngineTest {
         try (Strata db = Strata.open(temp)) { db.put(b("stable"), b("yes")); db.put(b("tail"), b("remove")); }
         Path wal = temp.resolve("wal-1.log");
         byte[] original = Files.readAllBytes(wal);
-        Files.write(wal, Arrays.copyOf(original, original.length - 2), StandardOpenOption.TRUNCATE_EXISTING);
+        int end = logicalEnd(original);
+        assertEquals(0, end + 4 <= original.length
+                        ? java.nio.ByteBuffer.wrap(original, end, 4).order(java.nio.ByteOrder.LITTLE_ENDIAN).getInt()
+                        : -1,
+                "WAL must end at a frame boundary before truncation, end=" + end + " length=" + original.length);
+        Files.write(wal, Arrays.copyOf(original, end - 2), StandardOpenOption.TRUNCATE_EXISTING);
         try (Strata db = Strata.open(temp)) {
             assertEquals("yes", s(db.get(b("stable")).orElseThrow()));
             assertTrue(db.get(b("tail")).isEmpty());
@@ -72,7 +93,9 @@ class StrataEngineTest {
             db.write(List.of(Mutation.put(b("stable"), b("yes")), Mutation.put(b("also-stable"), b("yes"))));
             db.put(b("tail"), b("remove"));
         }
-        byte[] wal = Files.readAllBytes(originalDir.resolve("wal-1.log"));
+        byte[] fullWal = Files.readAllBytes(originalDir.resolve("wal-1.log"));
+        int walEnd = logicalEnd(fullWal);
+        byte[] wal = Arrays.copyOf(fullWal, walEnd);
         int firstBatchEnd = wal.length - Format.frame(Mutation.put(b("tail"), b("remove"))).length;
         for (int length = 0; length < wal.length; length++) {
             Path candidate = temp.resolve("truncated-" + length);
@@ -105,7 +128,8 @@ class StrataEngineTest {
         }
         Path wal = temp.resolve("wal-1.log");
         byte[] original = Files.readAllBytes(wal);
-        Files.write(wal, Arrays.copyOf(original, original.length - 1), StandardOpenOption.TRUNCATE_EXISTING);
+        int end = logicalEnd(original);
+        Files.write(wal, Arrays.copyOf(original, end - 1), StandardOpenOption.TRUNCATE_EXISTING);
         try (Strata db = Strata.open(temp)) {
             assertTrue(db.get(b("first")).isEmpty());
             assertTrue(db.get(b("second")).isEmpty());
