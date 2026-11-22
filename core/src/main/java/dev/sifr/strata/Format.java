@@ -63,6 +63,7 @@ final class Format {
                 byte[] header = { (byte) first, rest[0], rest[1], rest[2] };
                 ByteBuffer b = ByteBuffer.wrap(header).order(ByteOrder.LITTLE_ENDIAN);
                 int length = b.getInt();
+                if (length == 0) break; // preallocated, never-written tail
                 if (length < 4 || length > MAX_FRAME_BYTES) throw new IOException("invalid WAL frame length");
                 byte[] body = in.readNBytes(length);
                 if (body.length < length) break;

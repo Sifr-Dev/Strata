@@ -10,13 +10,16 @@ import java.util.concurrent.TimeUnit;
 /** Explicit in-memory and durable workloads; not a competitor comparison. */
 @BenchmarkMode(Mode.AverageTime)
 @OutputTimeUnit(TimeUnit.MICROSECONDS)
-@Warmup(iterations = 3, time = 1)
+@Warmup(iterations = 5, time = 1)
 @Measurement(iterations = 5, time = 1)
-@Fork(2)
+@Fork(3)
 @State(Scope.Benchmark)
 public class EngineBenchmark {
-    @Param({"1000"})
+    @Param({"10000"})
     int entries;
+    @Param({"FLUSH_ONLY", "SYNC"})
+    String durability;
+
     Strata db;
     Path directory;
     byte[][] keys;
@@ -24,7 +27,8 @@ public class EngineBenchmark {
     @Setup(Level.Trial)
     public void setup() throws IOException {
         directory = Files.createTempDirectory("strata-jmh");
-        db = Strata.open(StrataOptions.builder(directory).durability(StrataOptions.Durability.FLUSH_ONLY).build());
+        db = Strata.open(StrataOptions.builder(directory)
+                .durability(StrataOptions.Durability.valueOf(durability)).build());
         keys = new byte[entries][];
         for (int i = 0; i < entries; i++) {
             keys[i] = String.format(Locale.ROOT, "%08d", i).getBytes(java.nio.charset.StandardCharsets.US_ASCII);
