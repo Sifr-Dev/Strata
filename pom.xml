@@ -3,7 +3,7 @@
   <modelVersion>4.0.0</modelVersion>
   <groupId>dev.sifr</groupId>
   <artifactId>strata-parent</artifactId>
-  <version>0.1.0-SNAPSHOT</version>
+  <version>0.1.0</version>
   <packaging>pom</packaging>
   <name>Strata</name>
   <modules><module>core</module><module>benchmarks</module></modules>
