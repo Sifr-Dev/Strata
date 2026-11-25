@@ -55,8 +55,17 @@ final class StrataEngine implements Strata {
 
     static StrataEngine open(StrataOptions options) throws IOException {
         StrataEngine engine = new StrataEngine(options);
-        engine.recover();
-        return engine;
+        try {
+            engine.recover();
+            return engine;
+        } catch (Throwable error) {
+            try {
+                engine.close();
+            } catch (Throwable closeError) {
+                error.addSuppressed(closeError);
+            }
+            throw error;
+        }
     }
 
     private void recover() throws IOException {
