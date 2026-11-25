@@ -24,6 +24,6 @@ jobs:
           java-version: ${{ matrix.java }}
           cache: maven
       - run: mvn --batch-mode --no-transfer-progress clean verify
-      - run: java -jar core/target/strata-0.1.0-SNAPSHOT.jar "$RUNNER_TEMP/strata-smoke" put ci works
-      - run: test "$(java -jar core/target/strata-0.1.0-SNAPSHOT.jar "$RUNNER_TEMP/strata-smoke" get ci)" = works
-      - run: java -jar benchmarks/target/strata-benchmarks-0.1.0-SNAPSHOT.jar -l
+      - run: java -jar core/target/strata-0.1.0.jar "$RUNNER_TEMP/strata-smoke" put ci works
+      - run: test "$(java -jar core/target/strata-0.1.0.jar "$RUNNER_TEMP/strata-smoke" get ci)" = works
+      - run: java -jar benchmarks/target/strata-benchmarks-0.1.0.jar -l

@@ -37,9 +37,9 @@ Keys are non-empty unsigned byte strings. Inputs and outputs are copied. Empty s
 
 ```sh
 mvn package
-java -jar core/target/strata-0.1.0-SNAPSHOT.jar ./data put greeting hello
-java -jar core/target/strata-0.1.0-SNAPSHOT.jar ./data get greeting
-java -jar core/target/strata-0.1.0-SNAPSHOT.jar ./data compact
+java -jar core/target/strata-0.1.0.jar ./data put greeting hello
+java -jar core/target/strata-0.1.0.jar ./data get greeting
+java -jar core/target/strata-0.1.0.jar ./data compact
 ```
 
 `scan FROM TO` emits hexadecimal entries for the half-open range. The CLI accepts UTF-8 text for put/get/delete; binary applications should use the library.
