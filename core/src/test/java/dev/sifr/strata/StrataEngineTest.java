@@ -161,6 +161,17 @@ class StrataEngineTest {
         Files.move(temp.resolve("segment-2.sst"), temp.resolve("segment-1.sst"));
     }
 
+    @Test void failedOpenReleasesStoreLease() throws Exception {
+        Files.write(temp.resolve("MANIFEST"), new byte[] { 1, 2, 3 });
+        assertThrows(java.io.IOException.class, () -> Strata.open(temp));
+
+        Files.delete(temp.resolve("MANIFEST"));
+        try (Strata db = Strata.open(temp)) {
+            db.put(b("recovered"), b("yes"));
+            assertEquals("yes", s(db.get(b("recovered")).orElseThrow()));
+        }
+    }
+
     @Test void secondProcessCannotAcquireStoreLease() throws Exception {
         try (Strata db = Strata.open(temp)) {
             assertThrows(java.io.IOException.class, () -> Strata.open(temp));
