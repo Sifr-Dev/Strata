@@ -11,9 +11,11 @@ All integers are unsigned-length fields encoded little-endian unless stated othe
 - mutations: `u8 type` (1 put, 2 delete), `u32 keyLength`, key, and for put `u32 valueLength`, value
 - `u32 crc32(payloadLength field + payload)`
 
-One frame is one atomic batch. Complete frames replay in order. A partial final header/payload/checksum or checksum mismatch at the physical end discards that frame; subsequent data or malformed interior data is fatal. The WAL is checkpointed and recreated on open, so a damaged tail is never extended.
+One frame is one atomic batch. Complete frames replay in order. A partial final header/payload/checksum discards that frame; subsequent data or malformed interior data is fatal. The WAL is checkpointed and recreated on open, so a damaged tail is never extended.
 
-The WAL is preallocated in fixed windows (default 1 MiB). The region between the last written frame and the physical end of the file is zero filler; a frame header whose length field is zero terminates recovery, and any nonzero length that fails validation remains fatal. The logical end of the log is therefore the offset of the first zero length field, not the file size.
+The WAL is preallocated in fixed windows (default 1 MiB). The region between the last written frame and the physical end of the file is zero filler; a frame header whose length field is zero terminates recovery. The logical end of the log is therefore the offset of the first zero length field, not the file size.
+
+Because the file is preallocated, a crash that interrupts a write leaves the unfinished frame surrounded by durable filler, so "is this frame at the end of the file" cannot decide whether it is recoverable. The end of written data is the offset just past the last non-zero byte. A frame is discarded as an interrupted append only when it is not fully covered by written data, or when its checksum bytes hold a written prefix that matches the recomputed checksum followed only by filler. A frame that fails validation inside written data has damaged bytes: silently discarding it would lose an acknowledged batch, so it remains fatal. This distinction is exercised by `WalRecoveryFaultTest`, which injects every cut point of an append in both tear shapes.
 
 ## Segment
 
