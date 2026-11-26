@@ -49,56 +49,110 @@ final class Format {
         return out.array();
     }
 
+    /**
+     * Replays complete frames and discards a batch whose append was interrupted.
+     *
+     * <p>The log is preallocated with zero filler, so the file length is not the
+     * number of durable bytes. A crash stops a write part-way through a frame and
+     * leaves the remaining bytes of that frame as filler zeros. Recovery must drop
+     * such a batch (it was never acknowledged) without also dropping a batch that
+     * was written and later damaged.
+     *
+     * <p>The two cases are told apart by how much of the frame was written:
+     * <ul>
+     *   <li>a valid frame is replayed, including one whose last byte is zero;</li>
+     *   <li>a frame that does not validate and is not fully covered by written
+     *       bytes is an interrupted append and stops replay;</li>
+     *   <li>a frame that does not validate inside written bytes is damaged and is
+     *       fatal, because discarding it would silently lose an acknowledged
+     *       batch.</li>
+     * </ul>
+     *
+     * <p>A write can also be cut inside the four checksum bytes. Those bytes then
+     * hold a prefix of the real checksum followed by zeros. That is only treated
+     * as an interrupted append when the written prefix matches the recomputed
+     * checksum exactly; any other mismatch stays fatal. This keeps the decision
+     * from depending on a coincidence that damage could also produce.
+     */
     static List<Mutation> readLog(Path path) throws IOException {
         if (!Files.exists(path)) return List.of();
-        if (Files.size(path) < WAL_MAGIC.length) return List.of(); // incomplete header contains no acknowledged frame
-        try (InputStream in = new BufferedInputStream(Files.newInputStream(path))) {
-            expectMagic(in, WAL_MAGIC);
-            List<Mutation> result = new ArrayList<>();
-            while (true) {
-                int first = in.read();
-                if (first < 0) break;
-                byte[] rest = in.readNBytes(3);
-                if (rest.length < 3) break; // A partial final frame header is recoverable.
-                byte[] header = { (byte) first, rest[0], rest[1], rest[2] };
-                ByteBuffer b = ByteBuffer.wrap(header).order(ByteOrder.LITTLE_ENDIAN);
-                int length = b.getInt();
-                if (length == 0) break; // preallocated, never-written tail
-                if (length < 4 || length > MAX_FRAME_BYTES) throw new IOException("invalid WAL frame length");
-                byte[] body = in.readNBytes(length);
-                if (body.length < length) break;
-                byte[] crcBytes = in.readNBytes(4);
-                if (crcBytes.length < 4) break;
-                CRC32 crc = new CRC32(); crc.update(body);
-                int stored = ByteBuffer.wrap(crcBytes).order(ByteOrder.LITTLE_ENDIAN).getInt();
-                if (stored != (int) crc.getValue()) {
-                    if (in.read() >= 0) throw new IOException("WAL checksum mismatch before end of log");
-                    break;
-                }
-                ByteBuffer record = ByteBuffer.wrap(body).order(ByteOrder.LITTLE_ENDIAN);
-                int count = record.getInt();
-                if (count < 1 || count > (length - 4) / 5) throw new IOException("invalid WAL batch count");
-                List<Mutation> batch = new ArrayList<>(count);
-                for (int i = 0; i < count; i++) {
-                    if (record.remaining() < 5) throw new IOException("truncated WAL mutation");
-                    int type = Byte.toUnsignedInt(record.get());
-                    int keyLength = record.getInt();
-                    if (keyLength < 1 || keyLength > record.remaining()) throw new IOException("invalid WAL key length");
-                    byte[] key = new byte[keyLength]; record.get(key);
-                    if (type == 1) {
-                        if (record.remaining() < 4) throw new IOException("truncated WAL value length");
-                        int valueLength = record.getInt();
-                        if (valueLength < 0 || valueLength > record.remaining()) throw new IOException("invalid WAL value length");
-                        byte[] value = new byte[valueLength]; record.get(value);
-                        batch.add(Mutation.put(key, value));
-                    } else if (type == 2) batch.add(Mutation.delete(key));
-                    else throw new IOException("invalid WAL mutation type");
-                }
-                if (record.hasRemaining()) throw new IOException("trailing WAL mutation bytes");
-                result.addAll(batch);
-            }
-            return List.copyOf(result);
+        byte[] log = Files.readAllBytes(path);
+        if (log.length < WAL_MAGIC.length) return List.of(); // incomplete header holds no acknowledged frame
+        if (!Arrays.equals(Arrays.copyOf(log, WAL_MAGIC.length), WAL_MAGIC)) {
+            throw new IOException("unsupported or truncated storage header");
         }
+        long writtenEnd = lastWrittenOffset(log);
+        List<Mutation> result = new ArrayList<>();
+        int offset = WAL_MAGIC.length;
+        while (offset + 4 <= log.length) {
+            int length = ByteBuffer.wrap(log, offset, 4).order(ByteOrder.LITTLE_ENDIAN).getInt();
+            if (length == 0) break; // preallocated, never-written tail
+            int bodyStart = offset + 4;
+            int crcStart = bodyStart + length;
+            long crcEnd = crcStart + 4L;
+            if (length < 4 || length > MAX_FRAME_BYTES) {
+                if (crcEnd > writtenEnd) break; // length field itself was torn
+                throw new IOException("invalid WAL frame length inside written data");
+            }
+            if (crcEnd > log.length) break; // physically truncated append
+            int stored = ByteBuffer.wrap(log, crcStart, 4).order(ByteOrder.LITTLE_ENDIAN).getInt();
+            CRC32 crc = new CRC32();
+            crc.update(log, bodyStart, length);
+            if (stored != (int) crc.getValue()) {
+                if (crcEnd <= writtenEnd) throw new IOException("WAL checksum mismatch inside written data");
+                if (!isTornChecksum(log, crcStart, (int) crc.getValue(), writtenEnd)) {
+                    throw new IOException("WAL checksum mismatch inside written data");
+                }
+                break; // checksum write was interrupted
+            }
+            ByteBuffer record = ByteBuffer.wrap(log, bodyStart, length).order(ByteOrder.LITTLE_ENDIAN);
+            int count = record.getInt();
+            if (count < 1 || count > (length - 4) / 5) throw new IOException("invalid WAL batch count");
+            List<Mutation> batch = new ArrayList<>(count);
+            for (int i = 0; i < count; i++) {
+                if (record.remaining() < 5) throw new IOException("truncated WAL mutation");
+                int type = Byte.toUnsignedInt(record.get());
+                int keyLength = record.getInt();
+                if (keyLength < 1 || keyLength > record.remaining()) throw new IOException("invalid WAL key length");
+                byte[] key = new byte[keyLength]; record.get(key);
+                if (type == 1) {
+                    if (record.remaining() < 4) throw new IOException("truncated WAL value length");
+                    int valueLength = record.getInt();
+                    if (valueLength < 0 || valueLength > record.remaining()) throw new IOException("invalid WAL value length");
+                    byte[] value = new byte[valueLength]; record.get(value);
+                    batch.add(Mutation.put(key, value));
+                } else if (type == 2) batch.add(Mutation.delete(key));
+                else throw new IOException("invalid WAL mutation type");
+            }
+            if (record.hasRemaining()) throw new IOException("trailing WAL mutation bytes");
+            result.addAll(batch);
+            offset = Math.toIntExact(crcEnd);
+        }
+        return List.copyOf(result);
+    }
+
+    /**
+     * True when the checksum field holds an unwritten zero suffix after a written
+     * prefix that matches the recomputed checksum. Bytes past {@code writtenEnd}
+     * are filler zeros, so only the prefix needs comparing.
+     */
+    private static boolean isTornChecksum(byte[] log, int crcStart, int computed, long writtenEnd) {
+        ByteBuffer expected = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(computed);
+        for (int i = 0; i < 4; i++) {
+            int actual = Byte.toUnsignedInt(log[crcStart + i]);
+            boolean written = crcStart + i < writtenEnd;
+            int wanted = Byte.toUnsignedInt(expected.get(i));
+            if (written ? actual != wanted : actual != 0) return false;
+        }
+        return true;
+    }
+
+    /** Offset just past the last non-zero byte; the preallocated tail is filler. */
+    private static long lastWrittenOffset(byte[] log) {
+        for (int i = log.length - 1; i >= 0; i--) {
+            if (log[i] != 0) return i + 1L;
+        }
+        return 0;
     }
 
     static NavigableMap<ByteKey, byte[]> readSegment(Path path, StrataOptions options) throws IOException {
