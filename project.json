@@ -1,0 +1,9 @@
+{
+  "name": "Strata",
+  "description": "Layered storage and data",
+  "stack": [
+    "maven"
+  ],
+  "status": "experimental",
+  "primary_language": "Java"
+}
